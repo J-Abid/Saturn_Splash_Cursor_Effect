@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Matte Gyro - Final Voltage</title>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Roboto+Mono:wght@300;400&display=swap" rel="stylesheet">
+
+    <style>
+        body { 
+            background-color: #000; 
+            margin: 0; 
+            overflow: hidden; 
+            font-family: 'Roboto Mono', monospace; 
+            color: #e0e0e0; 
+            cursor: none; 
+        }
+        .canvas-layer { position: fixed; inset: 0; pointer-events: none; }
+        #fluid-layer { z-index: 10; mix-blend-mode: screen; opacity: 1.0; }
+        #scene-container { z-index: 1; }
+        #root { position: relative; z-index: 50; }
+        #ui-panel { cursor: default; }
+        #ui-panel button, #ui-panel input { cursor: pointer; }
+
+        input[type=range] { -webkit-appearance: none; width: 100%; background: transparent; margin: 8px 0; }
+        input[type=range]::-webkit-slider-track { width: 100%; height: 4px; background: #1a1a20; border-radius: 2px; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 14px; width: 8px; background: #00f0ff; cursor: ew-resize; margin-top: -5px; box-shadow: 0 0 10px #00f0ff; border-radius: 1px; }
+        
+        input[type=color] { -webkit-appearance: none; border: none; width: 30px; height: 30px; padding: 0; background: none; cursor: pointer; border-radius: 4px; overflow: hidden; }
+        input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+        input[type=color]::-webkit-color-swatch { border: 1px solid #444; border-radius: 4px; }
+        
+        .cyber-input { background: #0a0a0f; border: 1px solid #333; color: #fff; font-family: 'Roboto Mono'; font-size: 10px; padding: 4px 8px; width: 100%; outline: none; transition: 0.2s; }
+        .cyber-input:focus { border-color: #00f0ff; box-shadow: 0 0 5px rgba(0,240,255,0.3); }
+
+        .cyber-scroll::-webkit-scrollbar { width: 4px; }
+        .cyber-scroll::-webkit-scrollbar-track { background: #0a0a0f; }
+        .cyber-scroll::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+        .cyber-scroll::-webkit-scrollbar-thumb:hover { background: #00f0ff; }
+        
+        .editable-title { background: transparent; border: none; outline: none; text-align: center; width: 100%; text-transform: uppercase; color: transparent; background-clip: text; -webkit-background-clip: text; background-image: linear-gradient(to bottom, #fff, #94a3b8); cursor: text; }
+        .editable-title:focus { border-bottom: 1px solid #00f0ff; }
+    </style>
+</head>
+<body>
+    <canvas id="fluid-layer" class="canvas-layer"></canvas>
+    <div id="scene-container" class="absolute inset-0"></div>
+    <div id="root"></div>
+
+    <script>
+        // --- HELPER CLASSES FOR FLUID ENGINE ---
+        class PointerPrototype { constructor() { this.id = -1; this.texcoordX = 0; this.texcoordY = 0; this.prevTexcoordX = 0; this.prevTexcoordY = 0; this.deltaX = 0; this.deltaY = 0; this.down = false; this.moved = false; this.color = {r:0,g:0,b:0}; } }
+        
+        class Program {
+            constructor(gl, vertexShaderSrc, fragmentShaderSrc) {
+                this.gl = gl; this.uniforms = {}; this.program = this.createProgram(vertexShaderSrc, fragmentShaderSrc); this.uniforms = this.getUniforms(this.program);
+            }
+            bind() { this.gl.useProgram(this.program); }
+            createProgram(vSrc, fSrc) {
+                let gl = this.gl; let vShader = this.compileShader(gl.VERTEX_SHADER, vSrc); let fShader = this.compileShader(gl.FRAGMENT_SHADER, fSrc);
+                let program = gl.createProgram(); gl.attachShader(program, vShader); gl.attachShader(program, fShader); gl.linkProgram(program); return program;
+            }
+            compileShader(type, source) { let gl = this.gl; let shader = gl.createShader(type); gl.shaderSource(shader, source); gl.compileShader(shader); return shader; }
+            getUniforms(program) {
+                let gl = this.gl; let uniforms = []; let count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+                for (let i = 0; i < count; i++) { let name = gl.getActiveUniform(program, i).name; uniforms[name] = gl.getUniformLocation(program, name); } return uniforms;
+            }
+        }
+
+        class Material {
+            constructor(gl, vertexShader, fragmentShaderSource) { this.gl = gl; this.vertexShader = vertexShader; this.fragmentShaderSource = fragmentShaderSource; this.programs = []; this.activeProgram = null; this.uniforms = []; }
+            setKeywords(keywords) {
+                let hash = 0; for (let i = 0; i < keywords.length; i++) { let s = keywords[i]; for(let j=0; j<s.length; j++) hash = (hash<<5)-hash+s.charCodeAt(j)|0; }
+                let program = this.programs[hash];
+                if (program == null) { let kwdStr = ""; keywords.forEach(k => kwdStr += "#define " + k + "\n"); let p = new Program(this.gl, this.vertexShader, kwdStr + this.fragmentShaderSource); program = p.program; this.programs[hash] = program; }
+                if (program === this.activeProgram) return; this.activeProgram = program;
+                let count = this.gl.getProgramParameter(program, this.gl.ACTIVE_UNIFORMS); let uniforms = [];
+                for (let i = 0; i < count; i++) { let name = this.gl.getActiveUniform(program, i).name; uniforms[name] = this.gl.getUniformLocation(program, name); } this.uniforms = uniforms;
+            }
+            bind() { this.gl.useProgram(this.activeProgram); }
+        }
+
+        // --- FLUID ENGINE IMPLEMENTATION ---
+        class FluidWebGLEngine {
+            constructor(canvas) {
+                this.canvas = canvas; this.gl = null; this.ext = null; this.pointers = [];
+                this.config = {
+                    SIM_RESOLUTION: 128, DYE_RESOLUTION: 1024, DENSITY_DISSIPATION: 1,
+                    VELOCITY_DISSIPATION: 0.2, PRESSURE: 0.8, PRESSURE_ITERATIONS: 20,
+                    CURL: 30, SPLAT_RADIUS: 0.25, SPLAT_FORCE: 6000, SIM_SPEED: 1.0,
+                    SHADING: true, PAUSED: false,
+                    COLOR_A: { r: 0, g: 240/255, b: 255/255 }, COLOR_B: { r: 1, g: 0, b: 0.33 }
+                };
+                this.init();
+            }
+            updateConfig(newConfig) { Object.assign(this.config, newConfig); if(newConfig.shouldReinitFramebuffers) this.initFramebuffers(); }
+            init() {
+                const { gl, ext } = this.getWebGLContext(this.canvas);
+                this.gl = gl; this.ext = ext;
+                if (!ext.supportLinearFiltering) { this.config.DYE_RESOLUTION = 512; this.config.SHADING = false; }
+                this.initShaders(); this.initFramebuffers(); this.initBlit();
+                this.pointers.push(new PointerPrototype());
+                this.bindEvents();
+                this.animate();
+            }
+            getWebGLContext(canvas) {
+                const params = { alpha: true, depth: false, stencil: false, antialias: false };
+                let gl = canvas.getContext("webgl2", params);
+                const isWebGL2 = !!gl;
+                if (!isWebGL2) gl = canvas.getContext("webgl", params) || canvas.getContext("experimental-webgl", params);
+                let halfFloat, supportLinearFiltering;
+                if (isWebGL2) { gl.getExtension("EXT_color_buffer_float"); supportLinearFiltering = gl.getExtension("OES_texture_float_linear"); } 
+                else { halfFloat = gl.getExtension("OES_texture_half_float"); supportLinearFiltering = gl.getExtension("OES_texture_half_float_linear"); }
+                const halfFloatTexType = isWebGL2 ? gl.HALF_FLOAT : halfFloat && halfFloat.HALF_FLOAT_OES;
+                let formatRGBA, formatRG, formatR;
+                if (isWebGL2) {
+                    formatRGBA = this.getSupportedFormat(gl, gl.RGBA16F, gl.RGBA, halfFloatTexType);
+                    formatRG = this.getSupportedFormat(gl, gl.RG16F, gl.RG, halfFloatTexType);
+                    formatR = this.getSupportedFormat(gl, gl.R16F, gl.RED, halfFloatTexType);
+                } else {
+                    formatRGBA = this.getSupportedFormat(gl, gl.RGBA, gl.RGBA, halfFloatTexType);
+                    formatRG = this.getSupportedFormat(gl, gl.RGBA, gl.RGBA, halfFloatTexType);
+                    formatR = this.getSupportedFormat(gl, gl.RGBA, gl.RGBA, halfFloatTexType);
+                }
+                return { gl, ext: { formatRGBA, formatRG, formatR, halfFloatTexType, supportLinearFiltering } };
+            }
+            getSupportedFormat(gl, internalFormat, format, type) { return { internalFormat, format }; }
+            initShaders() {
+                const gl = this.gl; const s = this.getShaderSources();
+                this.material = new Material(gl, s.baseVertex, s.displayShader);
+                this.material.setKeywords(this.config.SHADING ? ["SHADING"] : []);
+                this.programs = {
+                    copy: new Program(gl, s.baseVertex, s.copyShader),
+                    clear: new Program(gl, s.baseVertex, s.clearShader),
+                    splat: new Program(gl, s.baseVertex, s.splatShader),
+                    advection: new Program(gl, s.baseVertex, s.advectionShader),
+                    divergence: new Program(gl, s.baseVertex, s.divergenceShader),
+                    curl: new Program(gl, s.baseVertex, s.curlShader),
+                    vorticity: new Program(gl, s.baseVertex, s.vorticityShader),
+                    pressure: new Program(gl, s.baseVertex, s.pressureShader),
+                    gradientSubtract: new Program(gl, s.baseVertex, s.gradientSubtractShader),
+                };
+            }
+            initFramebuffers() {
+                const gl = this.gl; const ext = this.ext;
+                let simRes = this.getResolution(this.config.SIM_RESOLUTION);
+                let dyeRes = this.getResolution(this.config.DYE_RESOLUTION);
+                const texType = ext.halfFloatTexType;
+                const filtering = ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST;
+                gl.disable(gl.BLEND);
+                this.dye = this.createOrResizeDoubleFBO(this.dye, dyeRes.width, dyeRes.height, ext.formatRGBA.internalFormat, ext.formatRGBA.format, texType, filtering);
+                this.velocity = this.createOrResizeDoubleFBO(this.velocity, simRes.width, simRes.height, ext.formatRG.internalFormat, ext.formatRG.format, texType, filtering);
+                this.divergence = this.createFBO(simRes.width, simRes.height, ext.formatR.internalFormat, ext.formatR.format, texType, gl.NEAREST);
+                this.curl = this.createFBO(simRes.width, simRes.height, ext.formatR.internalFormat, ext.formatR.format, texType, gl.NEAREST);
+                this.pressure = this.createOrResizeDoubleFBO(this.pressure, simRes.width, simRes.height, ext.formatR.internalFormat, ext.formatR.format, texType, gl.NEAREST);
+            }
+            createOrResizeDoubleFBO(target, w, h, internalFormat, format, type, param) {
+                if(!target || target.width !== w || target.height !== h) return this.createDoubleFBO(w, h, internalFormat, format, type, param);
+                return target;
+            }
+            createFBO(w, h, internalFormat, format, type, param) {
+                const gl = this.gl;
+                gl.activeTexture(gl.TEXTURE0);
+                let texture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, param);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, param);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null);
+                let fbo = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+                gl.viewport(0, 0, w, h);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                return { texture, fbo, width: w, height: h, texelSizeX: 1.0/w, texelSizeY: 1.0/h, attach(id) { gl.activeTexture(gl.TEXTURE0 + id); gl.bindTexture(gl.TEXTURE_2D, texture); return id; } };
+            }
+            createDoubleFBO(w, h, internalFormat, format, type, param) {
+                let fbo1 = this.createFBO(w, h, internalFormat, format, type, param);
+                let fbo2 = this.createFBO(w, h, internalFormat, format, type, param);
+                return { width: w, height: h, texelSizeX: fbo1.texelSizeX, texelSizeY: fbo1.texelSizeY, get read() { return fbo1; }, set read(value) { fbo1 = value; }, get write() { return fbo2; }, set write(value) { fbo2 = value; }, swap() { let temp = fbo1; fbo1 = fbo2; fbo2 = temp; } };
+            }
+            initBlit() {
+                const gl = this.gl;
+                gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, -1, 1, 1, 1, 1, -1]), gl.STATIC_DRAW);
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
+                gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(0);
+                this.blit = (target, clear = false) => {
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+                    gl.viewport(0, 0, target ? target.width : gl.drawingBufferWidth, target ? target.height : gl.drawingBufferHeight);
+                    if (clear) { gl.clearColor(0.0, 0.0, 0.0, 1.0); gl.clear(gl.COLOR_BUFFER_BIT); }
+                    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+                };
+            }
+            bindEvents() {
+                const mapColor = () => {
+                    const cA = this.config.COLOR_A; const cB = this.config.COLOR_B;
+                    let t = (Math.sin(Date.now() * 0.005) + 1) * 0.5;
+                    return { r: cA.r * (1-t) + cB.r * t, g: cA.g * (1-t) + cB.g * t, b: cA.b * (1-t) + cB.b * t };
+                };
+                window.addEventListener("mousemove", e => {
+                    let p = this.pointers[0];
+                    p.moved = p.down;
+                    p.prevTexcoordX = p.texcoordX; p.prevTexcoordY = p.texcoordY;
+                    p.texcoordX = e.clientX / window.innerWidth;
+                    p.texcoordY = 1.0 - e.clientY / window.innerHeight;
+                    p.deltaX = (p.texcoordX - p.prevTexcoordX) * (this.canvas.width/this.canvas.height);
+                    p.deltaY = p.texcoordY - p.prevTexcoordY;
+                    p.color = mapColor();
+                    if(Math.abs(p.deltaX) > 0 || Math.abs(p.deltaY) > 0) this.splatPointer(p);
+                });
+            }
+            splatPointer(pointer) {
+                let dx = pointer.deltaX * this.config.SPLAT_FORCE;
+                let dy = pointer.deltaY * this.config.SPLAT_FORCE;
+                this.splat(pointer.texcoordX, pointer.texcoordY, dx, dy, pointer.color);
+            }
+            splat(x, y, dx, dy, color) {
+                const gl = this.gl;
+                this.programs.splat.bind();
+                gl.uniform1i(this.programs.splat.uniforms.uTarget, this.velocity.read.attach(0));
+                gl.uniform1f(this.programs.splat.uniforms.aspectRatio, this.canvas.width / this.canvas.height);
+                gl.uniform2f(this.programs.splat.uniforms.point, x, y);
+                gl.uniform3f(this.programs.splat.uniforms.color, dx, dy, 0.0);
+                gl.uniform1f(this.programs.splat.uniforms.radius, this.config.SPLAT_RADIUS / 100.0);
+                this.blit(this.velocity.write); this.velocity.swap();
+
+                gl.uniform1i(this.programs.splat.uniforms.uTarget, this.dye.read.attach(0));
+                gl.uniform3f(this.programs.splat.uniforms.color, color.r, color.g, color.b);
+                this.blit(this.dye.write); this.dye.swap();
+            }
+            animate = () => {
+                if(!this.config.PAUSED) {
+                    this.step(0.016 * this.config.SIM_SPEED);
+                    this.render(null);
+                }
+                requestAnimationFrame(this.animate);
+            }
+            step(dt) {
+                const gl = this.gl; const p = this.programs;
+                gl.disable(gl.BLEND);
+                p.curl.bind(); gl.uniform2f(p.curl.uniforms.texelSize, this.velocity.texelSizeX, this.velocity.texelSizeY); gl.uniform1i(p.curl.uniforms.uVelocity, this.velocity.read.attach(0)); this.blit(this.curl);
+                p.vorticity.bind(); gl.uniform2f(p.vorticity.uniforms.texelSize, this.velocity.texelSizeX, this.velocity.texelSizeY); gl.uniform1i(p.vorticity.uniforms.uVelocity, this.velocity.read.attach(0)); gl.uniform1i(p.vorticity.uniforms.uCurl, this.curl.attach(1)); gl.uniform1f(p.vorticity.uniforms.curl, this.config.CURL); gl.uniform1f(p.vorticity.uniforms.dt, dt); this.blit(this.velocity.write); this.velocity.swap();
+                p.divergence.bind(); gl.uniform2f(p.divergence.uniforms.texelSize, this.velocity.texelSizeX, this.velocity.texelSizeY); gl.uniform1i(p.divergence.uniforms.uVelocity, this.velocity.read.attach(0)); this.blit(this.divergence);
+                p.clear.bind(); gl.uniform1i(p.clear.uniforms.uTexture, this.pressure.read.attach(0)); gl.uniform1f(p.clear.uniforms.value, this.config.PRESSURE); this.blit(this.pressure.write); this.pressure.swap();
+                p.pressure.bind(); gl.uniform2f(p.pressure.uniforms.texelSize, this.velocity.texelSizeX, this.velocity.texelSizeY); gl.uniform1i(p.pressure.uniforms.uDivergence, this.divergence.attach(0));
+                for (let i = 0; i < this.config.PRESSURE_ITERATIONS; i++) { gl.uniform1i(p.pressure.uniforms.uPressure, this.pressure.read.attach(1)); this.blit(this.pressure.write); this.pressure.swap(); }
+                p.gradientSubtract.bind(); gl.uniform2f(p.gradientSubtract.uniforms.texelSize, this.velocity.texelSizeX, this.velocity.texelSizeY); gl.uniform1i(p.gradientSubtract.uniforms.uPressure, this.pressure.read.attach(0)); gl.uniform1i(p.gradientSubtract.uniforms.uVelocity, this.velocity.read.attach(1)); this.blit(this.velocity.write); this.velocity.swap();
+                p.advection.bind(); gl.uniform2f(p.advection.uniforms.texelSize, this.velocity.texelSizeX, this.velocity.texelSizeY); if (!this.ext.supportLinearFiltering) gl.uniform2f(p.advection.uniforms.dyeTexelSize, this.velocity.texelSizeX, this.velocity.texelSizeY);
+                let velocityId = this.velocity.read.attach(0); gl.uniform1i(p.advection.uniforms.uVelocity, velocityId); gl.uniform1i(p.advection.uniforms.uSource, velocityId); gl.uniform1f(p.advection.uniforms.dt, dt); gl.uniform1f(p.advection.uniforms.dissipation, this.config.VELOCITY_DISSIPATION); this.blit(this.velocity.write); this.velocity.swap();
+                if (!this.ext.supportLinearFiltering) gl.uniform2f(p.advection.uniforms.dyeTexelSize, this.dye.texelSizeX, this.dye.texelSizeY); gl.uniform1i(p.advection.uniforms.uVelocity, this.velocity.read.attach(0)); gl.uniform1i(p.advection.uniforms.uSource, this.dye.read.attach(1)); gl.uniform1f(p.advection.uniforms.dissipation, this.config.DENSITY_DISSIPATION); this.blit(this.dye.write); this.dye.swap();
+            }
+            render(target) {
+                const gl = this.gl; gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.enable(gl.BLEND);
+                let width = target == null ? gl.drawingBufferWidth : target.width; let height = target == null ? gl.drawingBufferHeight : target.height;
+                this.material.bind(); if (this.config.SHADING) gl.uniform2f(this.material.uniforms.texelSize, 1.0 / width, 1.0 / height);
+                gl.uniform1i(this.material.uniforms.uTexture, this.dye.read.attach(0)); this.blit(target);
+            }
+            getResolution(resolution) {
+                let aspectRatio = this.gl.drawingBufferWidth / this.gl.drawingBufferHeight; if (aspectRatio < 1) aspectRatio = 1.0 / aspectRatio;
+                const min = Math.round(resolution); const max = Math.round(resolution * aspectRatio);
+                return this.gl.drawingBufferWidth > this.gl.drawingBufferHeight ? { width: max, height: min } : { width: min, height: max };
+            }
+            getShaderSources() {
+                return {
+                    baseVertex: `precision highp float; attribute vec2 aPosition; varying vec2 vUv; varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB; uniform vec2 texelSize; void main () { vUv = aPosition * 0.5 + 0.5; vL = vUv - vec2(texelSize.x, 0.0); vR = vUv + vec2(texelSize.x, 0.0); vT = vUv + vec2(0.0, texelSize.y); vB = vUv - vec2(0.0, texelSize.y); gl_Position = vec4(aPosition, 0.0, 1.0); }`,
+                    copyShader: `precision mediump float; precision mediump sampler2D; varying highp vec2 vUv; uniform sampler2D uTexture; void main () { gl_FragColor = texture2D(uTexture, vUv); }`,
+                    clearShader: `precision mediump float; precision mediump sampler2D; varying highp vec2 vUv; uniform sampler2D uTexture; uniform float value; void main () { gl_FragColor = value * texture2D(uTexture, vUv); }`,
+                    displayShader: `precision highp float; precision highp sampler2D; varying vec2 vUv; varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB; uniform sampler2D uTexture; uniform vec2 texelSize; void main () { vec3 c = texture2D(uTexture, vUv).rgb; #ifdef SHADING vec3 lc = texture2D(uTexture, vL).rgb; vec3 rc = texture2D(uTexture, vR).rgb; vec3 tc = texture2D(uTexture, vT).rgb; vec3 bc = texture2D(uTexture, vB).rgb; float dx = length(rc) - length(lc); float dy = length(tc) - length(bc); vec3 n = normalize(vec3(dx, dy, length(texelSize))); vec3 l = vec3(0.0, 0.0, 1.0); float diffuse = clamp(dot(n, l) + 0.7, 0.7, 1.0); c *= diffuse; #endif float a = max(c.r, max(c.g, c.b)); gl_FragColor = vec4(c, a); }`,
+                    splatShader: `precision highp float; precision highp sampler2D; varying vec2 vUv; uniform sampler2D uTarget; uniform float aspectRatio; uniform vec3 color; uniform vec2 point; uniform float radius; void main () { vec2 p = vUv - point.xy; p.x *= aspectRatio; vec3 splat = exp(-dot(p, p) / radius * 0.4) * color; vec3 base = texture2D(uTarget, vUv).xyz; gl_FragColor = vec4(base + splat, 1.0); }`,
+                    advectionShader: `precision highp float; precision highp sampler2D; varying vec2 vUv; uniform sampler2D uVelocity; uniform sampler2D uSource; uniform vec2 texelSize; uniform vec2 dyeTexelSize; uniform float dt; uniform float dissipation; vec4 bilerp (sampler2D sam, vec2 uv, vec2 tsize) { vec2 st = uv / tsize - 0.5; vec2 iuv = floor(st); vec2 fuv = fract(st); vec4 a = texture2D(sam, (iuv + vec2(0.5, 0.5)) * tsize); vec4 b = texture2D(sam, (iuv + vec2(1.5, 0.5)) * tsize); vec4 c = texture2D(sam, (iuv + vec2(0.5, 1.5)) * tsize); vec4 d = texture2D(sam, (iuv + vec2(1.5, 1.5)) * tsize); return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y); } void main () { vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texelSize; vec4 result = texture2D(uSource, coord); float decay = 1.0 + dissipation * dt; gl_FragColor = result / decay; }`,
+                    divergenceShader: `precision mediump float; precision mediump sampler2D; varying highp vec2 vUv; varying highp vec2 vL; varying highp vec2 vR; varying highp vec2 vT; varying highp vec2 vB; uniform sampler2D uVelocity; void main () { float L = texture2D(uVelocity, vL).x; float R = texture2D(uVelocity, vR).x; float T = texture2D(uVelocity, vT).y; float B = texture2D(uVelocity, vB).y; vec2 C = texture2D(uVelocity, vUv).xy; if (vL.x < 0.0) { L = -C.x; } if (vR.x > 1.0) { R = -C.x; } if (vT.y > 1.0) { T = -C.y; } if (vB.y < 0.0) { B = -C.y; } float div = 0.5 * (R - L + T - B); gl_FragColor = vec4(div, 0.0, 0.0, 1.0); }`,
+                    curlShader: `precision mediump float; precision mediump sampler2D; varying highp vec2 vUv; varying highp vec2 vL; varying highp vec2 vR; varying highp vec2 vT; varying highp vec2 vB; uniform sampler2D uVelocity; void main () { float L = texture2D(uVelocity, vL).y; float R = texture2D(uVelocity, vR).y; float T = texture2D(uVelocity, vT).x; float B = texture2D(uVelocity, vB).x; float vorticity = R - L - T + B; gl_FragColor = vec4(0.5 * vorticity, 0.0, 0.0, 1.0); }`,
+                    vorticityShader: `precision highp float; precision highp sampler2D; varying vec2 vUv; varying vec2 vL; varying vec2 vR; varying vec2 vT; varying vec2 vB; uniform sampler2D uVelocity; uniform sampler2D uCurl; uniform float curl; uniform float dt; void main () { float L = texture2D(uCurl, vL).x; float R = texture2D(uCurl, vR).x; float T = texture2D(uCurl, vT).x; float B = texture2D(uCurl, vB).x; float C = texture2D(uCurl, vUv).x; vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L)); force /= length(force) + 0.0001; force *= curl * C; force.y *= -1.0; vec2 velocity = texture2D(uVelocity, vUv).xy; velocity += force * dt; velocity = min(max(velocity, -1000.0), 1000.0); gl_FragColor = vec4(velocity, 0.0, 1.0); }`,
+                    pressureShader: `precision mediump float; precision mediump sampler2D; varying highp vec2 vUv; varying highp vec2 vL; varying highp vec2 vR; varying highp vec2 vT; varying highp vec2 vB; uniform sampler2D uPressure; uniform sampler2D uDivergence; void main () { float L = texture2D(uPressure, vL).x; float R = texture2D(uPressure, vR).x; float T = texture2D(uPressure, vT).x; float B = texture2D(uPressure, vB).x; float C = texture2D(uPressure, vUv).x; float divergence = texture2D(uDivergence, vUv).x; float pressure = (L + R + B + T - divergence) * 0.25; gl_FragColor = vec4(pressure, 0.0, 0.0, 1.0); }`,
+                    gradientSubtractShader: `precision mediump float; precision mediump sampler2D; varying highp vec2 vUv; varying highp vec2 vL; varying highp vec2 vR; varying highp vec2 vT; varying highp vec2 vB; uniform sampler2D uPressure; uniform sampler2D uVelocity; void main () { float L = texture2D(uPressure, vL).x; float R = texture2D(uPressure, vR).x; float T = texture2D(uPressure, vT).x; float B = texture2D(uPressure, vB).x; vec2 velocity = texture2D(uVelocity, vUv).xy; velocity.xy -= vec2(R - L, T - B); gl_FragColor = vec4(velocity, 0.0, 1.0); }`
+                };
+            }
+        }
+    </script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, createContext, useContext } = React;
+        const ConfigContext = createContext();
+
+        const DEFAULT_CONFIG = {
+            pBase: "#050505", pGlow: "#001133", pRough: 0.2, pMetal: 0.8,
+            r1Col: "#ff0055", r2Col: "#00f0ff", r3Col: "#ccff00", 
+            rThick: 0.1, rMetal: 0.9, rRough: 0.1,
+            gyroPattern: true,
+            stars: true, ast: true, shoot: true, nebula: true, nebColor: "#1a0033", 
+            neutron: false, neptune: false, neptuneColA: "#0a1a3a", neptuneColB: "#0044aa",
+            lightning: false, lightningColA: "#00f0ff", lightningColB: "#ffffff", lightningIntensity: 1.2,
+            rotSpeed: 1.0,
+            fluidEnabled: true, fluidRes: 128, fluidDissipation: 1.0, fluidForce: 6000, fluidRadius: 40, fluidSpeed: 1.0, fluidColorA: "#00f0ff", fluidColorB: "#ff0055",
+            title: "MATTE GYRO", sub: "CYBER EDITION"
+        };
+
+        const hexToRgb = (hex) => {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? { r: parseInt(result[1], 16)/255, g: parseInt(result[2], 16)/255, b: parseInt(result[3], 16)/255 } : { r:0,g:0,b:0 };
+        }
+
+        const FluidLayer = () => {
+            const { config } = useContext(ConfigContext);
+            const engineRef = useRef(null);
+            useEffect(() => {
+                const canvas = document.getElementById('fluid-layer');
+                const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; if(engineRef.current) engineRef.current.initFramebuffers(); };
+                window.addEventListener('resize', resize); resize();
+                try { engineRef.current = new FluidWebGLEngine(canvas); } catch(e) { console.error("WebGL init failed", e); }
+                return () => window.removeEventListener('resize', resize);
+            }, []);
+            useEffect(() => {
+                if(engineRef.current) {
+                    document.getElementById('fluid-layer').style.display = config.fluidEnabled ? 'block' : 'none';
+                    engineRef.current.updateConfig({
+                        SIM_RESOLUTION: config.fluidRes, DENSITY_DISSIPATION: 4.0 - (config.fluidDissipation * 0.03), SPLAT_FORCE: config.fluidForce,
+                        SPLAT_RADIUS: config.fluidRadius / 1000.0, SIM_SPEED: config.fluidSpeed,
+                        COLOR_A: hexToRgb(config.fluidColorA), COLOR_B: hexToRgb(config.fluidColorB),
+                    });
+                }
+            }, [config]);
+            return null;
+        };
+
+        const Scene = () => {
+            const mountRef = useRef(null);
+            const { config } = useContext(ConfigContext);
+            const configRef = useRef(config);
+            const state = useRef({ drag: false, prev: {x:0, y:0}, vel: {x:0, y:0} });
+            const objs = useRef({ scene: null, renderer: null, planet: null, rGroup: null, neutronGroup: null, neptuneGroup: null, lGroup: null });
+
+            useEffect(() => { configRef.current = config; }, [config]);
+
+            useEffect(() => {
+                if(!mountRef.current) return;
+                const mount = mountRef.current;
+                const scene = new THREE.Scene();
+                scene.fog = new THREE.FogExp2(0x000000, 0.02);
+                
+                const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 1000);
+                camera.position.z = 25;
+                
+                const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+                renderer.setSize(innerWidth, innerHeight);
+                renderer.setPixelRatio(window.devicePixelRatio);
+                renderer.toneMapping = THREE.ACESFilmicToneMapping;
+                renderer.toneMappingExposure = 1.2;
+                mount.appendChild(renderer.domElement);
+
+                // Planet Setup
+                const planetMat = new THREE.MeshStandardMaterial({ color: config.pBase, emissive: config.pGlow, emissiveIntensity: 0.8, roughness: config.pRough, metalness: config.pMetal });
+                const planet = new THREE.Mesh(new THREE.SphereGeometry(3.5, 64, 64), planetMat);
+                const pGroup = new THREE.Group(); 
+                pGroup.add(planet); 
+                
+                const rGroup = new THREE.Group(); 
+                pGroup.add(rGroup); 
+                scene.add(pGroup);
+
+                // Neutron Core Setup
+                const neutronGroup = new THREE.Group();
+                neutronGroup.add(new THREE.Mesh(new THREE.SphereGeometry(1.2, 32, 32), new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false })));
+                neutronGroup.add(new THREE.Mesh(new THREE.SphereGeometry(2.0, 32, 32), new THREE.MeshBasicMaterial({ color: 0x00f0ff, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, side: THREE.BackSide })));
+                const beamGeo = new THREE.ConeGeometry(0.8, 40, 32, 1, true);
+                const beamMat = new THREE.MeshBasicMaterial({ color: 0x00f0ff, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
+                const topBeam = new THREE.Mesh(beamGeo, beamMat); topBeam.position.y = 20; neutronGroup.add(topBeam);
+                const botBeam = new THREE.Mesh(beamGeo, beamMat); botBeam.rotation.x = Math.PI; botBeam.position.y = -20; neutronGroup.add(botBeam);
+                scene.add(neutronGroup);
+
+                // Neptune Setup
+                const neptuneGroup = new THREE.Group();
+                neptuneGroup.add(new THREE.Mesh(new THREE.SphereGeometry(3.5, 64, 64), new THREE.MeshLambertMaterial({ color: config.neptuneColA })));
+                neptuneGroup.add(new THREE.Mesh(new THREE.SphereGeometry(3.6, 64, 64), new THREE.MeshLambertMaterial({ color: config.neptuneColB, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending, side: THREE.DoubleSide })));
+                scene.add(neptuneGroup);
+
+                // Lightning Group
+                const lGroup = new THREE.Group(); 
+                scene.add(lGroup); 
+
+                // Particles
+                const createParticles = (count, size, col, spread) => {
+                    const geo = new THREE.BufferGeometry();
+                    const pos = new Float32Array(count * 3);
+                    for(let i=0; i<count*3; i++) pos[i] = (Math.random()-0.5) * spread;
+                    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                    return new THREE.Points(geo, new THREE.PointsMaterial({ size, color: col, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending }));
+                };
+                const stars = createParticles(3000, 0.1, 0xffffff, 200); scene.add(stars);
+                const asteroids = createParticles(800, 0.08, 0x888888, 50); scene.add(asteroids);
+                const nebula = createParticles(300, 4.0, config.nebColor, 100); scene.add(nebula);
+                const sGroup = new THREE.Group(); scene.add(sGroup);
+
+                // Lights
+                const dirLight = new THREE.DirectionalLight(0xffffff, 2.0); dirLight.position.set(10, 10, 20); scene.add(dirLight);
+                const blueLight = new THREE.PointLight(0x00f0ff, 1, 50); blueLight.position.set(-10, -5, 10); scene.add(blueLight);
+                scene.add(new THREE.AmbientLight(0x404040, 0.5));
+
+                objs.current = { scene, camera, renderer, planet, rGroup, stars, asteroids, nebula, sGroup, neutronGroup, neptuneGroup, lGroup, pGroup };
+
+                // Input Handling
+                const onDown = e => { if(!e.target.closest('#ui-panel')) { state.current.drag=true; state.current.prev={x:e.clientX, y:e.clientY}; } };
+                const onUp = () => state.current.drag = false;
+                const onMove = e => { if(state.current.drag) { state.current.vel.y += (e.clientX - state.current.prev.x) * 0.0005; state.current.vel.x += (e.clientY - state.current.prev.y) * 0.0005; state.current.prev = {x: e.clientX, y: e.clientY}; } };
+                window.addEventListener('mousedown', onDown); window.addEventListener('mouseup', onUp); window.addEventListener('mousemove', onMove);
+
+                // --- HELPER: Random Vector ---
+                const getRandVec = () => {
+                    const v = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5);
+                    return v.normalize();
+                };
+
+                // --- 3D TUBE LIGHTNING GENERATOR ---
+                const createBolt = (start, end, segmentCount, offsetAmount, colHex, thick) => {
+                    const points = [];
+                    points.push(start);
+                    for(let i=1; i<segmentCount; i++) {
+                        const t = i / segmentCount;
+                        const base = new THREE.Vector3().lerpVectors(start, end, t);
+                        // Push out if inside planet radius (3.5)
+                        if(base.length() < 4.0) base.normalize().multiplyScalar(4.0); 
+                        
+                        const jitter = getRandVec().multiplyScalar(offsetAmount);
+                        points.push(base.add(jitter));
+                    }
+                    points.push(end);
+                    
+                    const curve = new THREE.CatmullRomCurve3(points);
+                    // TubeGeometry: curve, segments, radius, radialSegments, closed
+                    const geom = new THREE.TubeGeometry(curve, 8, thick * 0.15, 3, false);
+                    const mat = new THREE.MeshBasicMaterial({ 
+                        color: new THREE.Color(colHex), 
+                        transparent: true, 
+                        opacity: 1.0, 
+                        side: THREE.DoubleSide,
+                        blending: THREE.AdditiveBlending,
+                        depthTest: false // Ensures it glows "over" the geometry
+                    });
+                    
+                    const mesh = new THREE.Mesh(geom, mat);
+                    mesh.renderOrder = 9999;
+                    mesh.frustumCulled = false;
+                    return mesh;
+                };
+
+                // --- ANIMATION LOOP ---
+                const animate = () => {
+                    requestAnimationFrame(animate);
+                    const cfg = configRef.current; 
+                    const spd = cfg.rotSpeed || 1;
+                    
+                    // Planet Rotation
+                    if(!state.current.drag) {
+                        state.current.vel.x *= 0.95; state.current.vel.y *= 0.95;
+                        pGroup.rotation.y += 0.002 * spd;
+                    }
+                    pGroup.rotation.y += state.current.vel.y; pGroup.rotation.x += state.current.vel.x;
+
+                    // Rings Animation
+                    if(rGroup.children.length === 3) {
+                        if(cfg.gyroPattern) {
+                            rGroup.children[0].rotation.z += 0.01 * spd; rGroup.children[1].rotation.z -= 0.008 * spd; rGroup.children[2].rotation.z += 0.012 * spd;
+                        } else {
+                            rGroup.children.forEach((r, i) => { r.rotation.z += (i%2===0 ? 0.01 : -0.008) * spd; r.rotation.x = (Math.PI/2) + Math.sin(Date.now()*0.001 * (i+1))*0.1; });
+                        }
+                    }
+
+                    // Background Animation
+                    stars.rotation.y -= 0.0001; asteroids.rotation.y -= 0.0005 * spd; nebula.rotation.y += 0.0002;
+                    
+                    // Alternate Cores
+                    if(cfg.neutron) { neutronGroup.rotation.y += 0.2; const s = 1 + Math.sin(Date.now()*0.05)*0.05; neutronGroup.scale.set(s,s,s); } 
+                    else if (cfg.neptune) { neptuneGroup.children[0].rotation.y += 0.001 * spd; neptuneGroup.children[1].rotation.y -= 0.003 * spd; }
+
+                    // Shooting Stars
+                    if(cfg.shoot && Math.random() < 0.02) {
+                        const star = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,4)]), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 1 }));
+                        star.position.set((Math.random()-.5)*80, (Math.random()-.5)*80, -30); star.lookAt(0,0,0); sGroup.add(star);
+                    }
+                    sGroup.children.forEach(c => { c.translateZ(2); c.material.opacity-=0.05; if(c.material.opacity<=0) { sGroup.remove(c); c.geometry.dispose(); c.material.dispose(); } });
+
+                    // --- LIGHTNING UPDATE FIXED ---
+                    if(cfg.lightning) {
+                        const cA = new THREE.Color(cfg.lightningColA);
+                        const cB = new THREE.Color(cfg.lightningColB);
+                        const mixColor = cA.clone().lerp(cB, Math.random());
+                        
+                        // Surface Bolts (Planet)
+                        if(Math.random() < 0.15) { // Increased frequency
+                            const start = getRandVec().multiplyScalar(3.8); // Start just above surface
+                            const end = getRandVec().multiplyScalar(3.8);
+                            // Only draw if points are relatively close (arc across surface)
+                            if(start.distanceTo(end) < 6) {
+                                lGroup.add(createBolt(start, end, 6, 0.4, mixColor, cfg.lightningIntensity));
+                            }
+                        }
+                        
+                        // Background/Space Bolts
+                        if(Math.random() < 0.1) {
+                            const center = new THREE.Vector3((Math.random()-0.5)*40, (Math.random()-0.5)*40, -10);
+                            const start = center.clone().add(getRandVec().multiplyScalar(5));
+                            const end = center.clone().add(getRandVec().multiplyScalar(5));
+                            lGroup.add(createBolt(start, end, 5, 0.8, mixColor, cfg.lightningIntensity));
+                        }
+                    }
+                    
+                    // Cleanup Lightning (Slower Fade)
+                    for(let i = lGroup.children.length - 1; i >= 0; i--) {
+                        const b = lGroup.children[i];
+                        b.material.opacity -= 0.02; // Slower fade for better visibility
+                        if(b.material.opacity <= 0) { 
+                            lGroup.remove(b); 
+                            if(b.geometry) b.geometry.dispose(); 
+                            if(b.material) b.material.dispose(); 
+                        }
+                    }
+
+                    renderer.render(scene, camera);
+                };
+                animate();
+
+                return () => {
+                    window.removeEventListener('mousedown', onDown); window.removeEventListener('mouseup', onUp); window.removeEventListener('mousemove', onMove);
+                    mount.innerHTML = '';
+                };
+            }, []);
+
+            useEffect(() => {
+                const { planet, rGroup, stars, asteroids, nebula, sGroup, neutronGroup, neptuneGroup, lGroup } = objs.current;
+                if(!planet) return;
+                
+                planet.material.color.set(config.pBase); planet.material.emissive.set(config.pGlow); planet.material.roughness = config.pRough; planet.material.metalness = config.pMetal;
+                if(neptuneGroup) { neptuneGroup.children[0].material.color.set(config.neptuneColA); neptuneGroup.children[1].material.color.set(config.neptuneColB); }
+
+                stars.visible = config.stars; asteroids.visible = config.ast; nebula.visible = config.nebula; nebula.material.color.set(config.nebColor); sGroup.visible = config.shoot;
+                
+                if(config.neutron) { planet.visible = false; neutronGroup.visible = true; neptuneGroup.visible = false; } 
+                else if (config.neptune) { planet.visible = false; neutronGroup.visible = false; neptuneGroup.visible = true; } 
+                else { planet.visible = true; neutronGroup.visible = false; neptuneGroup.visible = false; }
+
+                // Clear lightning if disabled
+                if(!config.lightning) { 
+                    while(lGroup.children.length) { 
+                        const c = lGroup.children[0]; 
+                        lGroup.remove(c); 
+                        if(c.geometry) c.geometry.dispose(); 
+                        if(c.material) c.material.dispose(); 
+                    } 
+                }
+
+                while(rGroup.children.length) { const m = rGroup.children[0]; m.geometry.dispose(); m.material.dispose(); rGroup.remove(m); }
+                const mkRing = (r, t, c) => {
+                    const m = new THREE.Mesh(new THREE.TorusGeometry(r, config.rThick, 4, 120), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: 0.5, roughness: config.rRough, metalness: config.rMetal, transparent: true, opacity: 0.9, side: THREE.DoubleSide }));
+                    m.rotation.x = t; rGroup.add(m);
+                };
+                if (config.gyroPattern) { mkRing(5.0, Math.PI/2.1, config.r1Col); mkRing(6.5, Math.PI/6, config.r2Col); mkRing(8.0, -Math.PI/4, config.r3Col); } 
+                else { mkRing(5.0, Math.PI/2, config.r1Col); mkRing(6.5, Math.PI/2, config.r2Col); mkRing(8.0, Math.PI/2, config.r3Col); }
+
+            }, [config]);
+
+            return <div id="scene-container" ref={mountRef} className="absolute inset-0" />;
+        };
+
+        const ColorControl = ({ label, value, onChange }) => (
+            <div className="mb-3" onClick={(e) => e.stopPropagation()}> 
+                <label className="text-[10px] text-gray-400 mb-1 block uppercase">{label}</label>
+                <div className="flex items-center gap-2">
+                    <div className="relative w-8 h-8 rounded border border-gray-600 overflow-hidden flex-shrink-0"><input type="color" value={value} onChange={(e) => onChange(e.target.value)} className="absolute -top-2 -left-2 w-16 h-16 p-0 border-0 cursor-pointer" /></div>
+                    <input type="text" value={value} onChange={(e) => onChange(e.target.value)} className="cyber-input uppercase" maxLength={7} />
+                </div>
+            </div>
+        );
+
+        const SettingsPanel = () => {
+            const { config, setConfig } = useContext(ConfigContext);
+            const [open, setOpen] = useState(false);
+            const [tab, setTab] = useState('MAIN');
+            const h = (k, v) => setConfig(prev => ({...prev, [k]: v}));
+
+            const TabBtn = ({ id, icon, label }) => ( <button onClick={() => setTab(id)} className={`flex-1 py-3 text-[10px] font-bold tracking-widest border-b-2 transition-all ${tab === id ? 'border-[#00f0ff] text-[#00f0ff] bg-white/5' : 'border-transparent text-gray-500 hover:text-white'}`}><i className={`fa-solid ${icon} mb-1 block text-sm`}></i>{label}</button> );
+            const Range = ({ label, min, max, step, val, k }) => ( <div className="mb-4"><label className="text-[10px] text-gray-400 mb-1 block uppercase flex justify-between"><span>{label}</span> <span className="text-[#00f0ff]">{val}</span></label><input type="range" min={min} max={max} step={step} value={val} onChange={e => h(k, parseFloat(e.target.value))} /></div> );
+            const Toggle = ({ label, k }) => ( <label className="flex items-center justify-between cursor-pointer group mb-2 p-2 rounded hover:bg-white/5 transition"><span className="text-xs text-gray-300 group-hover:text-[#00f0ff] transition uppercase font-bold">{label}</span><div className="relative"><input type="checkbox" checked={config[k]} onChange={e => h(k, e.target.checked)} className="sr-only peer" /><div className="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#00f0ff]"></div></div></label> );
+
+            return (
+                <div id="ui-panel" className="fixed bottom-8 right-8 z-50 flex flex-col items-end font-mono">
+                    {open && (
+                        <div className="bg-[#050508]/95 backdrop-blur-xl border border-gray-800 w-80 rounded-lg shadow-[0_0_50px_rgba(0,0,0,0.8)] overflow-hidden mb-4 animate-fade-in-up">
+                            <div className="bg-[#000] p-3 border-b border-gray-800 flex justify-between items-center shadow-lg">
+                                <span className="text-[#00f0ff] text-xs font-black tracking-[0.2em]"><i className="fas fa-microchip mr-2"></i>SYS_CONFIG_V9</span>
+                                <span className="text-[9px] text-green-500 font-bold px-2 py-0.5 border border-green-900 bg-green-900/20 rounded">ACTIVE</span>
+                            </div>
+                            <div className="flex bg-black/40 border-b border-gray-800"><TabBtn id="MAIN" icon="fa-globe" label="CORE" /><TabBtn id="RINGS" icon="fa-ring" label="RINGS" /><TabBtn id="SPACE" icon="fa-meteor" label="COSMOS" /><TabBtn id="FLUID" icon="fa-water" label="FLUID" /></div>
+                            <div className="p-5 h-80 overflow-y-auto cyber-scroll" onClick={(e) => e.stopPropagation()}>
+                                {tab === 'MAIN' && ( <> <div className="grid grid-cols-2 gap-2"><ColorControl label="Base" value={config.pBase} onChange={v => h('pBase', v)} /><ColorControl label="Glow" value={config.pGlow} onChange={v => h('pGlow', v)} /></div><Range label="Roughness" min="0" max="1" step="0.1" val={config.pRough} k="pRough" /><Range label="Metalness" min="0" max="1" step="0.1" val={config.pMetal} k="pMetal" /><Range label="Rotation Speed" min="0" max="5" step="0.1" val={config.rotSpeed} k="rotSpeed" /></> )}
+                                {tab === 'RINGS' && ( <> <div className="bg-white/5 p-2 rounded mb-4 border border-gray-700"><Toggle label="Gyro Pattern" k="gyroPattern" /></div><ColorControl label="Inner Ring" value={config.r1Col} onChange={v => h('r1Col', v)} /><ColorControl label="Middle Ring" value={config.r2Col} onChange={v => h('r2Col', v)} /><ColorControl label="Outer Ring" value={config.r3Col} onChange={v => h('r3Col', v)} /><div className="h-px bg-gray-800 my-3"></div><Range label="Thickness" min="0.01" max="0.5" step="0.01" val={config.rThick} k="rThick" /><Range label="Metalness" min="0" max="1" step="0.1" val={config.rMetal} k="rMetal" /></> )}
+                                {tab === 'SPACE' && ( <div className="space-y-1"> <Toggle label="Star Field" k="stars" /><Toggle label="Asteroid Belt" k="ast" /><Toggle label="Data Streams" k="shoot" /><Toggle label="Nebula Clouds" k="nebula" /><div className="border border-gray-800 p-3 rounded bg-white/5 mt-3 space-y-4"><div><Toggle label="Neutron Core" k="neutron" /></div><div><Toggle label="Neptune Core" k="neptune" />{config.neptune && (<div className="grid grid-cols-2 gap-2 mt-2"><ColorControl label="Core" value={config.neptuneColA} onChange={v => h('neptuneColA', v)} /><ColorControl label="Atmos" value={config.neptuneColB} onChange={v => h('neptuneColB', v)} /></div>)}</div><div className="border-t border-gray-700 pt-2"><Toggle label="Surface Electricity" k="lightning" />{config.lightning && (<div className="space-y-2 mt-2"><div className="grid grid-cols-2 gap-2"><ColorControl label="Bolt A" value={config.lightningColA} onChange={v => h('lightningColA', v)} /><ColorControl label="Bolt B" value={config.lightningColB} onChange={v => h('lightningColB', v)} /></div><Range label="Bolt Intensity" min="0.1" max="3.0" step="0.1" val={config.lightningIntensity} k="lightningIntensity" /></div>)}</div></div><div className="mt-4"><ColorControl label="Nebula Tint" value={config.nebColor} onChange={v => h('nebColor', v)} /></div></div> )}
+                                {tab === 'FLUID' && ( <> <Toggle label="Active Simulation" k="fluidEnabled" /><div className="grid grid-cols-2 gap-2 mt-2"><ColorControl label="Grad Start" value={config.fluidColorA} onChange={v => h('fluidColorA', v)} /><ColorControl label="Grad End" value={config.fluidColorB} onChange={v => h('fluidColorB', v)} /></div><div className="border-t border-gray-700 my-4 pt-2"><Range label="Splash Radius" min="0" max="100" step="1" val={config.fluidRadius} k="fluidRadius" /><Range label="Splash Speed" min="0.1" max="5.0" step="0.1" val={config.fluidSpeed} k="fluidSpeed" /><Range label="Glow Force" min="1000" max="10000" step="100" val={config.fluidForce} k="fluidForce" /><Range label="Dissipation" min="0" max="100" step="1" val={config.fluidDissipation} k="fluidDissipation" /></div></> )}
+                            </div>
+                        </div>
+                    )}
+                    <button onClick={() => setOpen(!open)} className="w-14 h-14 bg-[#050508] border border-[#00f0ff] rounded-full flex items-center justify-center text-[#00f0ff] hover:bg-[#00f0ff] hover:text-black transition-all shadow-[0_0_20px_rgba(0,240,255,0.4)] z-50 group"><i className={`fa-solid ${open ? 'fa-times' : 'fa-gear'} text-xl group-hover:rotate-90 transition-transform duration-300`}></i></button>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [config, setConfig] = useState(DEFAULT_CONFIG);
+            return (
+                <ConfigContext.Provider value={{ config, setConfig }}>
+                    <div className="relative w-full h-screen">
+                        <div className="absolute top-20 left-0 w-full z-20 text-center pointer-events-auto mix-blend-screen select-none">
+                            <div className="max-w-3xl mx-auto px-4">
+                                <input value={config.title} onChange={(e) => setConfig({...config, title: e.target.value})} className="editable-title font-['Orbitron'] text-5xl md:text-8xl font-black tracking-tighter mb-2 drop-shadow-[0_0_10px_rgba(255,255,255,0.5)]" />
+                                <input value={config.sub} onChange={(e) => setConfig({...config, sub: e.target.value})} className="editable-title font-mono text-sm md:text-xl tracking-[0.6em] text-[#00f0ff] opacity-90" />
+                            </div>
+                        </div>
+                        <FluidLayer />
+                        <Scene />
+                        <SettingsPanel />
+                    </div>
+                </ConfigContext.Provider>
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
